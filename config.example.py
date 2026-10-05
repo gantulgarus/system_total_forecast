@@ -20,6 +20,8 @@ DB_CONFIG = {
 # ==========================
 LARAVEL_API_URL = "http://localhost:8000/api/forecast/store"
 LARAVEL_LAST_HISTORY_URL = "http://localhost:8000/api/forecast/last-history-time"
+# Бодит ачаалал (Хянах самбартай ижил станцуудын нийлбэр). Заагаагүй бол LARAVEL_API_URL-аас гаргана.
+LARAVEL_ACTUAL_LOAD_URL = "http://localhost:8000/api/forecast/actual-load"
 
 # ==========================
 # Ulaanbaatar координат

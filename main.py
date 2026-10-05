@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Forecast системийн хэрэглээ (цаг тутмын) - ЗАСВАРЛАСАН
-- MySQL өгөгдлийн сангаас load татах
+- Laravel API-аас load татах (/api/forecast/actual-load — Хянах самбартай ижил станцуудын нийлбэр)
 - Open-Meteo API-аас Ulaanbaatar temperature татах (API key шаардлагагүй!)
 - Feature engineering (hourly / daily lag)
 - AdaBoost forecast
 - График гаргах + CSV хадгалах
 """
 
+import os
 import pandas as pd
-from sqlalchemy import create_engine
 from sklearn.model_selection import train_test_split
 from sklearn.ensemble import AdaBoostRegressor
 from sklearn.tree import DecisionTreeRegressor
@@ -23,142 +23,65 @@ import time
 import numpy as np
 
 # Тохиргоо импортлох
-from config import DB_CONFIG, LARAVEL_API_URL, LARAVEL_LAST_HISTORY_URL, LOCATION, MODEL_CONFIG, FILES, PLOT_CONFIG
+from config import LARAVEL_API_URL, LARAVEL_LAST_HISTORY_URL, LOCATION, MODEL_CONFIG, FILES, PLOT_CONFIG
 
 warnings.filterwarnings("ignore")
 
 # ==========================
-# 1️⃣ MySQL холболт
+# 1️⃣-2️⃣ Цаг тутмын системийн ачаалал — Laravel API (Хянах самбартай ижил)
 # ==========================
-engine = create_engine(
-    "mysql+pymysql://{user}:{password}@{host}:{port}/{database}?charset=utf8mb4".format(**DB_CONFIG)
+# Өмнө нь SYSTEM_TOTAL_P − (Том Нар, Багануур, Сонгино БХ цэнэглэлт)-ийг энд тооцдог байсан.
+# Одоо Хянах самбарын графиктай яг ижил байлгахын тулд Laravel-ийн SystemLoad-оос авна:
+#   system_load — станцуудын нийлбэр (БХ цэнэглэлт тооцохгүй) = Хянах самбарын үндсэн шугам
+#   load        — нийлбэр − БХ цэнэглэлт = Хянах самбарын «хэрэглээ» (таамаглалын бодит хэрэглээ)
+# Импортын тэмдэг, Эрдэнэ БХ, гараас оруулсан утга зэрэг дүрэм Laravel талд нэг газар байна.
+import config as _cfg
+LARAVEL_ACTUAL_LOAD_URL = getattr(
+    _cfg, 'LARAVEL_ACTUAL_LOAD_URL',
+    LARAVEL_API_URL.replace('/forecast/store', '/forecast/actual-load')
 )
+HISTORY_START = '2024-01-05'
+# Станцуудын нийлбэр СКАДА-аас үүнээс их зөрвөл (станцын телеметр дутуу — ж: Бөөрөлжүүт ЦС 2025.11-ээс өмнө,
+# телеметрийн тасалдал) сургалтад СКАДА-д суурилсан утгыг авна. Илгээх/харуулах утга нь Хянах самбарынх хэвээр.
+TRAIN_FALLBACK_MW = 50
 
-# ==========================
-# 2️⃣ Цаг тутмын системийн хэрэглээ татах - ШИНЭЧЛЭГДСЭН
-# ==========================
-print("📊 MySQL-ээс өгөгдөл татаж байна...")
+print("📊 Laravel-аас цаг тутмын ачаалал татаж байна...")
+print(f"   URL: {LARAVEL_ACTUAL_LOAD_URL}")
 
-# Бүх өгөгдлийг нэг дор авъя (2024-01-05 00:00:00 цагаас одоо хүртэл)
-# Энэ query нь түүхэн дата + өнөөдрийн датаг хамтад нь татна
-query = """
-SELECT
-    TIMESTAMP_S,
-    VAR,
-    CAST(VALUE AS DECIMAL(10,2)) AS value
-FROM z_conclusion
-WHERE VAR IN ('SYSTEM_TOTAL_P', 'ERDENE_SPP_BHB_TOTAL_P', 'BAGANUUR_BESS_TOTAL_P_T', 'SONGINO_BESS_TOTAL_P')
-  AND CALCULATION = 50
-  AND TIMESTAMP_S >= UNIX_TIMESTAMP('2024-01-05 00:00:00')
-ORDER BY TIMESTAMP_S
-"""
+df_load = pd.DataFrame(columns=['time_', 'system_load', 'load', 'load_dashboard'])
+try:
+    resp = requests.get(LARAVEL_ACTUAL_LOAD_URL, params={'from': HISTORY_START}, timeout=180)
+    resp.raise_for_status()
+    payload = resp.json()
+    if payload.get('success') and payload.get('data'):
+        df_load = pd.DataFrame(payload['data'])
+        # time — цагийн эхлэлийн орон нутгийн цаг (z_conclusion-ий тэмдэглэгээтэй ижил)
+        df_load['time_'] = pd.to_datetime(df_load['time'])
+        df_load = df_load[['time_', 'system_load', 'load', 'scada_load']].astype(
+            {'system_load': float, 'load': float, 'scada_load': float})
+        df_load = df_load.sort_values('time_').reset_index(drop=True)
 
-df_raw = pd.read_sql(query, engine)
+        # load_dashboard — Хянах самбарын «хэрэглээ» (Laravel-д илгээж харуулна)
+        # load           — загварт (сургалт, lag) ашиглах цэвэрлэсэн утга
+        df_load['load_dashboard'] = df_load['load']
+        charge = df_load['system_load'] - df_load['load']          # БХ цэнэглэлт (≥ 0)
+        bad = df_load['scada_load'].notna() & ((df_load['system_load'] - df_load['scada_load']).abs() > TRAIN_FALLBACK_MW)
+        df_load.loc[bad, 'load'] = df_load.loc[bad, 'scada_load'] - charge[bad]
+        df_load = df_load.drop(columns=['scada_load'])
+        print(f"   Сургалтад СКАДА-аар орлуулсан цаг: {int(bad.sum())} (станцын нийлбэр {TRAIN_FALLBACK_MW} МВт-аас их зөрсөн)")
+except Exception as e:
+    print(f"❌ Алдаа: ачааллын өгөгдөл татаж чадсангүй: {e}")
 
-# Excel WEEKDAY() форматаар долоо хоногийн өдрийг буцаах
-# Ням=1, Даваа=2, Мягмар=3, Лхагва=4, Пүрэв=5, Баасан=6, Бямба=7
-def excel_weekday(dt):
-    """Python weekday (Даваа=0) -> Excel WEEKDAY (Ням=1)"""
-    wd = (dt.weekday() + 2) % 7
-    return 7 if wd == 0 else wd
-
-# Батарейны утгыг тохируулах функц
-# Логик:
-# - Эерэг (өгч байна) → 0 (хасахгүй)
-# - Сөрөг (цэнэглэж байна) → |утга| (хасах)
-def adjust_battery_value(value):
-    """
-    Батарейны утгыг тохируулах:
-    - Хэрэв утга >= 0 бол (системд эрчим хүч өгч байгаа) → хасахгүй
-    - Хэрэв утга < 0 бол (системээс цэнэглэж байгаа) → сөрөг утгыг эерэг болгож хасах
-    """
-    if value >= 0:  # Системд өгч байна
-        return 0  # Хасахгүй
-    else:  # Системээс авч байна (цэнэглэж байна)
-        return -value  # Сөрөг утгыг эерэг болгож хасах
-
-# Хэрэв өгөгдөл байхгүй бол
-if df_raw.empty:
+if df_load.empty:
     print("❌ Алдаа: Өгөгдөл олдсонгүй!")
-    df_load = pd.DataFrame(columns=['time_', 'system_load', 'erdene_bess', 'baganuur_bess', 'songino_bess', 'load'])
 else:
-    print(f"✅ Түүхийн өгөгдөл: {len(df_raw)} мөр")
-    print(f"   VAR төрлүүд: {df_raw['VAR'].unique().tolist()}")
-    
-    # UNIX timestamp-ыг хүснэгтэд нэмэх (UTC+8 Монголын цаг)
-    df_raw['time_'] = pd.to_datetime(df_raw['TIMESTAMP_S'] + 8*3600, unit='s')
-    df_raw['hour_group'] = df_raw['time_'].dt.floor('H')
-    
-    # Өгөгдлийг тусдаа хэсгүүдэд хуваах
-    df_system = df_raw[df_raw['VAR'].str.upper() == 'SYSTEM_TOTAL_P'].copy()
-    df_erdene = df_raw[df_raw['VAR'].str.upper() == 'ERDENE_SPP_BHB_TOTAL_P'].copy()
-    df_baganuur = df_raw[df_raw['VAR'].str.upper() == 'BAGANUUR_BESS_TOTAL_P_T'].copy()
-    df_songino = df_raw[df_raw['VAR'].str.upper() == 'SONGINO_BESS_TOTAL_P'].copy()
-    
-    # Батарейны утгуудыг тохируулах
-    df_erdene['value_adjusted'] = df_erdene['value'].apply(adjust_battery_value)
-    df_baganuur['value_adjusted'] = df_baganuur['value'].apply(adjust_battery_value)
-    df_songino['value_adjusted'] = df_songino['value'].apply(adjust_battery_value)
-    
-    # Цаг бүрт дундаж утгыг тооцоолох
-    df_system_hourly = df_system.groupby('hour_group')['value'].max().reset_index()
-    df_system_hourly.columns = ['time_', 'system_load']
-    
-    df_erdene_hourly = df_erdene.groupby('hour_group')['value_adjusted'].mean().reset_index()
-    df_erdene_hourly.columns = ['time_', 'erdene_bess']
-    
-    df_baganuur_hourly = df_baganuur.groupby('hour_group')['value_adjusted'].mean().reset_index()
-    df_baganuur_hourly.columns = ['time_', 'baganuur_bess']
-    
-    df_songino_hourly = df_songino.groupby('hour_group')['value_adjusted'].mean().reset_index()
-    df_songino_hourly.columns = ['time_', 'songino_bess']
-    
-    # Бүх өгөгдлийг нэгтгэх
-    df_load = df_system_hourly.copy()
-    
-    merge_dfs = [
-        (df_erdene_hourly, 'erdene_bess'),
-        (df_baganuur_hourly, 'baganuur_bess'),
-        (df_songino_hourly, 'songino_bess')
-    ]
-    
-    for df_temp, col_name in merge_dfs:
-        if not df_temp.empty:
-            df_load = pd.merge(df_load, df_temp, on='time_', how='left')
-    
-    # NULL утгуудыг 0 болгох
-    df_load['erdene_bess'] = df_load['erdene_bess'].fillna(0)
-    df_load['baganuur_bess'] = df_load['baganuur_bess'].fillna(0)
-    df_load['songino_bess'] = df_load['songino_bess'].fillna(0)
-    
-    # Бодит хэрэглээг тооцоолох
-    df_load['load'] = df_load['system_load'] - df_load['erdene_bess'] - df_load['baganuur_bess'] - df_load['songino_bess']
-    
-    # Дарааллаар эрэмбэлэх
-    df_load = df_load.sort_values('time_').reset_index(drop=True)
-    
     print(f"\n✅ Цагийн өгөгдөл бэлэн: {len(df_load)} цаг")
     print(f"   Хугацаа: {df_load['time_'].min()} - {df_load['time_'].max()}")
-    
-    # Батарейны статистик
-    print(f"\n📊 Батарейны утгууд (тохируулсан):")
-    for battery in ['erdene_bess', 'baganuur_bess', 'songino_bess']:
-        min_val = df_load[battery].min()
-        max_val = df_load[battery].max()
-        mean_val = df_load[battery].mean()
-        count_positive = (df_load[battery] > 0).sum()
-        count_zero = (df_load[battery] == 0).sum()
-        
-        print(f"   {battery.upper()}:")
-        print(f"     Утга: {min_val:.1f} → {max_val:.1f} МВт")
-        print(f"     Дундаж: {mean_val:.1f} МВт")
-        print(f"     Эерэг утгатай: {count_positive} цаг")
-        print(f"     Тэг утгатай: {count_zero} цаг")
-    
     print(f"\n📊 Хэрэглээний статистик:")
-    print(f"   Системийн хэрэглээ: {df_load['system_load'].min():.0f} - {df_load['system_load'].max():.0f} МВт")
-    print(f"   Бодит хэрэглээ: {df_load['load'].min():.0f} - {df_load['load'].max():.0f} МВт")
-    print(f"   Батарейнуудын нийт хасагдсан: {df_load[['erdene_bess', 'baganuur_bess', 'songino_bess']].sum().sum():.0f} МВт")
+    print(f"   Станцуудын нийлбэр: {df_load['system_load'].min():.0f} - {df_load['system_load'].max():.0f} МВт")
+    print(f"   Бодит хэрэглээ (Хянах самбар): {df_load['load_dashboard'].min():.0f} - {df_load['load_dashboard'].max():.0f} МВт")
+    print(f"   Сургалтын хэрэглээ (цэвэрлэсэн): {df_load['load'].min():.0f} - {df_load['load'].max():.0f} МВт")
+    print(f"   БХ цэнэглэлт нийт: {(df_load['system_load'] - df_load['load_dashboard']).sum():.0f} МВт.ц")
 
 # ==========================
 # 3️⃣ Temperature Open-Meteo API-аас татах
@@ -333,52 +256,101 @@ df['forecast_hourly'] = model_hourly.predict(X_hourly).round(0)
 
 # ==========================
 # 🔮 ӨДРИЙН ТААМАГЛАЛ (01:00 - 00:00)
+# Өдөрт нэг удаа л тооцоолж, файлд хадгална
 # ==========================
 today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-future_hours_daily = []
+daily_forecast_file = FILES['daily_forecast']
 
-for hour in range(1, 25):  # 01:00 - 00:00 (маргааш)
-    future_time = today + timedelta(hours=hour)
-    lag_data = df[df['time_'] < future_time].tail(24*7)
-    
-    if len(lag_data) < 24*7:
-        continue
-    
-    temp_current = df_temp[df_temp['time_'] == future_time]['temp'].values
-    if len(temp_current) == 0:
-        temp_current = df[df['time_'].dt.date == today.date()]['temp'].mean()
+# Өмнөх таамаглал байгаа эсэхийг шалгах
+need_new_forecast = True
+
+if os.path.exists(daily_forecast_file):
+    try:
+        df_daily_existing = pd.read_csv(daily_forecast_file)
+        df_daily_existing['time_'] = pd.to_datetime(df_daily_existing['time_'])
+
+        # Файл дахь таамаглал өнөөдрийнх эсэхийг шалгах
+        if len(df_daily_existing) > 0:
+            forecast_date = df_daily_existing['time_'].iloc[0].date()
+            if forecast_date == today.date():
+                # Өнөөдрийн таамаглал аль хэдийн байна - файлаас унших
+                df_daily_forecast = df_daily_existing
+                need_new_forecast = False
+                print(f"\n🔮 Өдрийн таамаглал: файлаас уншлаа ({len(df_daily_forecast)} цаг)")
+                print(f"   Тооцоолсон огноо: {forecast_date}")
+    except Exception as e:
+        print(f"   ⚠️ Файл унших алдаа: {e}")
+        need_new_forecast = True
+
+if need_new_forecast:
+    print(f"\n🔮 Өдрийн таамаглал шинээр тооцоолж байна...")
+    print("   Арга: Weighted Average (Уржигдар 50% + Ижил гариг 30% + 7 хоногийн дундаж 20%)")
+    future_hours_daily = []
+
+    # Өнөөдрийн 00:00 хүртэлх өгөгдлийг авах
+    baseline_time = today  # Өнөөдрийн 00:00
+    df_historical = df[df['time_'] < baseline_time].copy()
+
+    print(f"   Суурь өгөгдөл: {baseline_time.strftime('%Y-%m-%d %H:%M')} хүртэл")
+    print(f"   Түүхэн өгөгдөл: {len(df_historical)} цаг")
+
+    if len(df_historical) < 24*7:
+        print(f"   ⚠️ Өгөгдөл хүрэлцэхгүй байна (хамгийн багадаа {24*7} цаг хэрэгтэй)")
     else:
-        temp_current = temp_current[0]
-    
-    feature_daily = {
-        'year': future_time.year,
-        'month': future_time.month,
-        'day': future_time.day,
-        'hour': future_time.hour,
-        'temp': temp_current,
-        'wd': excel_weekday(future_time),
-        'load-1d': lag_data.iloc[-24]['load'] if len(lag_data) >= 24 else lag_data['load'].mean(),
-        'load-2d': lag_data.iloc[-48]['load'] if len(lag_data) >= 48 else lag_data['load'].mean(),
-        'load-3d': lag_data.iloc[-72]['load'] if len(lag_data) >= 72 else lag_data['load'].mean(),
-        'load-4d': lag_data.iloc[-96]['load'] if len(lag_data) >= 96 else lag_data['load'].mean(),
-        'load-5d': lag_data.iloc[-120]['load'] if len(lag_data) >= 120 else lag_data['load'].mean(),
-        'load-6d': lag_data.iloc[-144]['load'] if len(lag_data) >= 144 else lag_data['load'].mean(),
-        'load-7d': lag_data.iloc[-168]['load'] if len(lag_data) >= 168 else lag_data['load'].mean(),
-    }
-    
-    pred_daily = model_daily.predict(pd.DataFrame([feature_daily]))[0]
-    future_hours_daily.append({'time_': future_time, 'forecast_daily': round(pred_daily, 0)})
+        # Уржигдрийн өгөгдөл
+        yesterday = today - timedelta(days=1)
+        df_yesterday = df_historical[df_historical['time_'].dt.date == yesterday.date()].copy()
 
-df_daily_forecast = pd.DataFrame(future_hours_daily)
-print(f"\n🔮 Өдрийн таамаглал: {len(df_daily_forecast)} цаг (01:00 → 00:00)")
+        # 7 хоногийн цаг бүрийн дундаж
+        hourly_avg = df_historical.groupby('hour')['load'].mean().to_dict()
+
+        # Долоо хоногийн өмнөх ижил гаригийн өгөгдөл
+        same_weekday = today - timedelta(days=7)
+        df_same_weekday = df_historical[df_historical['time_'].dt.date == same_weekday.date()].copy()
+
+        print(f"   Уржигдрийн өгөгдөл: {len(df_yesterday)} цаг")
+        print(f"   Өмнөх ижил гаригийн өгөгдөл: {len(df_same_weekday)} цаг")
+
+        for hour in range(1, 25):  # 01:00 - 00:00 (маргааш)
+            future_time = today + timedelta(hours=hour)
+            h = future_time.hour
+
+            # 1. Уржигдрийн ижил цагийн утга
+            yesterday_same_hour = df_yesterday[df_yesterday['hour'] == h]['load'].values
+            load_yesterday = yesterday_same_hour[0] if len(yesterday_same_hour) > 0 else None
+
+            # 2. 7 хоногийн дундаж
+            load_weekly_avg = hourly_avg.get(h, df_historical['load'].mean())
+
+            # 3. Өмнөх долоо хоногийн ижил гариг, ижил цаг
+            same_wd_same_hour = df_same_weekday[df_same_weekday['hour'] == h]['load'].values
+            load_same_weekday = same_wd_same_hour[0] if len(same_wd_same_hour) > 0 else None
+
+            # Weighted average тооцоолох
+            if load_yesterday is not None and load_same_weekday is not None:
+                # Уржигдар 50% + Ижил гариг 30% + 7 хоногийн дундаж 20%
+                pred = load_yesterday * 0.5 + load_same_weekday * 0.3 + load_weekly_avg * 0.2
+            elif load_yesterday is not None:
+                # Уржигдар 70% + 7 хоногийн дундаж 30%
+                pred = load_yesterday * 0.7 + load_weekly_avg * 0.3
+            else:
+                # Зөвхөн 7 хоногийн дундаж
+                pred = load_weekly_avg
+
+            future_hours_daily.append({'time_': future_time, 'forecast_daily': round(pred, 0)})
+
+    df_daily_forecast = pd.DataFrame(future_hours_daily)
+
+    # Шинэ таамаглалыг файлд хадгалах
+    df_daily_forecast.to_csv(daily_forecast_file, index=False)
+    print(f"   ✅ Шинэ таамаглал хадгалагдлаа: {len(df_daily_forecast)} цаг (01:00 → 00:00)")
 
 # ==========================
-# ⚡ ЦАГИЙН ТААМАГЛАЛ - ЭНГИЙН
+# ⚡ ЦАГИЙН ТААМАГЛАЛ - AdaBoost модель
 # ==========================
 future_hours_hourly = []
 
-# Сүүлийн бодит цагийг df-ээс авах (одоогоор)
-# df дотор өнөөдрийн өгөгдөл дутуу байж магадгүй гэдгийг анхаарах
+# Сүүлийн бодит цагийг df-ээс авах
 last_actual = df[df['time_'].dt.date == today.date()].tail(1)
 if len(last_actual) == 0:
     last_actual = df.tail(1)
@@ -388,47 +360,69 @@ last_load = last_actual['load'].values[0]
 last_hour = pd.to_datetime(last_time)
 
 print(f"⚡ Цагийн таамаглал:")
+print(f"   Арга: AdaBoost модель (load-1h, load-2h, load-3h)")
 print(f"   Сүүлийн бодит (df-ээс): {last_hour.strftime('%Y-%m-%d %H:%M')} = {last_load:.0f} МВт")
 
-# Өнөөдрийн 01:00-өөс дараагийн 3 цаг хүртэл
+# 01:00-оос сүүлийн бодит + 3 цаг хүртэл таамаглах
+start_time = today + timedelta(hours=1)  # 01:00
 end_time = last_hour + timedelta(hours=3)
 
-current_time = today + timedelta(hours=1)  # 01:00-оос эхлэх
+# Сүүлийн 3 цагийн утгыг хадгалах (rolling forecast)
+recent_loads = list(df[df['time_'] <= last_hour].tail(3)['load'].values)
+
+current_time = start_time
 while current_time <= end_time:
-    lag_data = df[df['time_'] < current_time].tail(24)
-    
-    if len(lag_data) < 3:
+    # Бодит утга байвал ашиглах
+    actual_data = df[df['time_'] == current_time]['load'].values
+    if len(actual_data) > 0:
+        # Бодит утга байна - list-д нэмээд үргэлжлүүлэх
+        recent_loads.append(actual_data[0])
+        if len(recent_loads) > 3:
+            recent_loads.pop(0)
+        future_hours_hourly.append({
+            'time_': current_time,
+            'forecast_hourly': round(actual_data[0], 0)
+        })
         current_time += timedelta(hours=1)
         continue
-    
+
+    if len(recent_loads) < 3:
+        current_time += timedelta(hours=1)
+        continue
+
     temp_current = df_temp[df_temp['time_'] == current_time]['temp'].values
     if len(temp_current) == 0:
-        temp_current = lag_data['temp'].mean()
+        temp_current = df_temp['temp'].mean()
     else:
         temp_current = temp_current[0]
-    
+
     feature_hourly = {
         'month': current_time.month,
         'day': current_time.day,
         'hour': current_time.hour,
         'temp': temp_current,
         'wd': excel_weekday(current_time),
-        'load-1h': lag_data.iloc[-1]['load'] if len(lag_data) >= 1 else lag_data['load'].mean(),
-        'load-2h': lag_data.iloc[-2]['load'] if len(lag_data) >= 2 else lag_data['load'].mean(),
-        'load-3h': lag_data.iloc[-3]['load'] if len(lag_data) >= 3 else lag_data['load'].mean(),
+        'load-1h': recent_loads[-1],  # Сүүлийн утга (бодит эсвэл таамаглал)
+        'load-2h': recent_loads[-2],
+        'load-3h': recent_loads[-3],
     }
-    
+
     pred_hourly = model_hourly.predict(pd.DataFrame([feature_hourly]))[0]
     future_hours_hourly.append({
         'time_': current_time,
         'forecast_hourly': round(pred_hourly, 0)
     })
-    
+
+    # Таамаглалын утгыг list-д нэмэх (дараагийн цагт ашиглах)
+    recent_loads.append(pred_hourly)
+    if len(recent_loads) > 3:
+        recent_loads.pop(0)
+
     current_time += timedelta(hours=1)
 
 df_hourly_forecast = pd.DataFrame(future_hours_hourly)
 
-print(f"   → Нийт: {len(df_hourly_forecast)} цэг (01:00 → {end_time.strftime('%H:%M')})")
+print(f"   → Нийт: {len(df_hourly_forecast)} цэг ({start_time.strftime('%H:%M')} → {end_time.strftime('%H:%M')})")
 
 # Test дата дээр үнэлгээ
 pred_daily = model_daily.predict(x_test)
@@ -490,19 +484,34 @@ if len(df_today_actual) > 0:
         print(f"   Өмнөх: {last_hour.strftime('%H:%M')}, Одоо: {last_hour_new.strftime('%H:%M')} → Дахин тооцоолж байна...")
 
         future_hours_hourly_new = []
+        start_time_new = today + timedelta(hours=1)  # 01:00-оос эхлэх
         end_time_new = last_hour_new + timedelta(hours=3)
-        current_time_new = today + timedelta(hours=1)  # 01:00-оос эхлэх
 
+        # Rolling forecast - сүүлийн 3 цагийн утга
+        recent_loads_new = list(df[df['time_'] <= last_hour_new].tail(3)['load'].values)
+
+        current_time_new = start_time_new
         while current_time_new <= end_time_new:
-            lag_data = df[df['time_'] < current_time_new].tail(24)
+            # Бодит утга байвал ашиглах
+            actual_data_new = df[df['time_'] == current_time_new]['load'].values
+            if len(actual_data_new) > 0:
+                recent_loads_new.append(actual_data_new[0])
+                if len(recent_loads_new) > 3:
+                    recent_loads_new.pop(0)
+                future_hours_hourly_new.append({
+                    'time_': current_time_new,
+                    'forecast_hourly': round(actual_data_new[0], 0)
+                })
+                current_time_new += timedelta(hours=1)
+                continue
 
-            if len(lag_data) < 3:
+            if len(recent_loads_new) < 3:
                 current_time_new += timedelta(hours=1)
                 continue
 
             temp_current = df_temp[df_temp['time_'] == current_time_new]['temp'].values
             if len(temp_current) == 0:
-                temp_current = lag_data['temp'].mean() if 'temp' in lag_data.columns else 0
+                temp_current = df_temp['temp'].mean()
             else:
                 temp_current = temp_current[0]
 
@@ -512,9 +521,9 @@ if len(df_today_actual) > 0:
                 'hour': current_time_new.hour,
                 'temp': temp_current,
                 'wd': excel_weekday(current_time_new),
-                'load-1h': lag_data.iloc[-1]['load'] if len(lag_data) >= 1 else lag_data['load'].mean(),
-                'load-2h': lag_data.iloc[-2]['load'] if len(lag_data) >= 2 else lag_data['load'].mean(),
-                'load-3h': lag_data.iloc[-3]['load'] if len(lag_data) >= 3 else lag_data['load'].mean(),
+                'load-1h': recent_loads_new[-1],
+                'load-2h': recent_loads_new[-2],
+                'load-3h': recent_loads_new[-3],
             }
 
             pred_hourly = model_hourly.predict(pd.DataFrame([feature_hourly]))[0]
@@ -523,11 +532,16 @@ if len(df_today_actual) > 0:
                 'forecast_hourly': round(pred_hourly, 0)
             })
 
+            # Таамаглалыг дараагийн цагт ашиглах
+            recent_loads_new.append(pred_hourly)
+            if len(recent_loads_new) > 3:
+                recent_loads_new.pop(0)
+
             current_time_new += timedelta(hours=1)
 
         # Шинэ forecast ашиглах
         df_hourly_forecast = pd.DataFrame(future_hours_hourly_new)
-        print(f"   ✅ Шинэчилсэн: {len(df_hourly_forecast)} цаг (00:00 → {end_time_new.strftime('%H:%M')})")
+        print(f"   ✅ Шинэчилсэн: {len(df_hourly_forecast)} цаг ({start_time_new.strftime('%H:%M')} → {end_time_new.strftime('%H:%M')})")
 
 fig, ax = plt.subplots(figsize=PLOT_CONFIG['figsize'])
 
@@ -539,8 +553,8 @@ if len(df_today_actual) > 0 and 'system_load' in df_today_actual.columns:
     print("   ✅ Системийн нийт хэрэглээ зурагдлаа")
 
 # 2️⃣ Бодит хэрэглээ (улаан - батарей хассан)
-if len(df_today_actual) > 0 and 'load' in df_today_actual.columns:
-    ax.plot(df_today_actual['time_'], df_today_actual['load'],
+if len(df_today_actual) > 0 and 'load_dashboard' in df_today_actual.columns:
+    ax.plot(df_today_actual['time_'], df_today_actual['load_dashboard'],
             color=PLOT_CONFIG['colors']['actual'], linewidth=3.5, label='Бодит хэрэглээ (батарей хассан)',
             marker='o', markersize=6, zorder=5)
     print("   ✅ Бодит хэрэглээ зурагдлаа")
@@ -716,8 +730,8 @@ send_metrics_to_laravel()
 actual_data = [
     {
         'time': row['time_'], 
-        'value': row['load'],
-        'system_load': row['system_load']  # 🔴 НЭМ
+        'value': row['load_dashboard'],      # Хянах самбарын «хэрэглээ»
+        'system_load': row['system_load']    # Хянах самбарын станцуудын нийлбэр
     } 
     for _, row in df_today_actual.iterrows()
 ]
@@ -731,9 +745,13 @@ daily_data = [{'time': row['time_'], 'value': row['forecast_daily']}
 if daily_data:
     send_to_laravel('daily', daily_data)
 
-# Цагийн таамаглал илгээх
+# Цагийн таамаглал илгээх — зөвхөн бодит утга хараахан ороогүй цагууд.
+# Бодит утгатай цагийг (df_hourly_forecast-д бодит утгаар бөглөсөн) илгээвэл өмнө нь хадгалсан
+# жинхэнэ таамаглалыг дарж, таамаглалын нарийвчлалыг тооцох боломжгүй болгодог.
+_actual_times = set(df_load['time_'])
 hourly_data = [{'time': row['time_'], 'value': row['forecast_hourly']}
-               for _, row in df_hourly_forecast.iterrows()]
+               for _, row in df_hourly_forecast.iterrows()
+               if row['time_'] not in _actual_times]
 if hourly_data:
     send_to_laravel('hourly', hourly_data)
 
@@ -758,7 +776,7 @@ try:
         history_data = [
             {
                 'time': row['time_'],
-                'value': row['load'],
+                'value': row['load_dashboard'],
                 'system_load': row['system_load'],
                 'forecast_daily': row['forecast_daily'],
                 'forecast_hourly': row['forecast_hourly']
